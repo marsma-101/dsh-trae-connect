@@ -1,0 +1,25 @@
+{
+  "name": "dsh-trae-connect",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bring Trae CN (domestic) desktop-app models and credits into DeepSeek Harness: decrypt the local Trae CN credential, translate the Trae remote-session protocol behind a loopback OpenAI-compatible shim, and register a 'trae' model group.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "trae",
+    "model-provider"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
