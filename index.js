@@ -353,9 +353,15 @@ function thinkingLevelMapFor(traeEfforts) {
 function toPiModel(info, baseUrl, useMaximumContextWindow) {
 	const useMax = useMaximumContextWindow === true && isMaxModeModel(info);
 	const efforts = Array.isArray(info.traeEfforts) ? info.traeEfforts : [];
+	// Price display mirrors dsh-qoder-connect / dsh-workbuddy-connect: a zero
+	// rate means free, other rates show as a multiplier. Models without a
+	// declared consumption_rate (experimental slots) get no suffix.
+	const priceSuffix = info.traeRate === undefined || info.traeRate === null
+		? ""
+		: info.traeRate === 0 ? " · 免费" : ` · x${info.traeRate}`;
 	return {
 		id: info.id,
-		name: info.name,
+		name: `${info.name}${priceSuffix}`,
 		api: "openai-completions",
 		provider: TRAE_PROVIDER,
 		baseUrl,

@@ -59,12 +59,22 @@ function catalogModel(info) {
 	const traeEfforts = effortConfig?.support_thinking === true && Array.isArray(effortConfig.options)
 		? effortConfig.options.filter((level) => typeof level === "string")
 		: [];
+	// Consumption rate (credit multiplier) lives inside the features JSON,
+	// which arrives as either a string or an object. A missing/disabled rate
+	// stays undefined — never fabricate a number.
+	let traeRate;
+	try {
+		const feats = typeof info?.features === "string" ? JSON.parse(info.features) : info?.features;
+		const rate = feats?.consumption_rate;
+		if (rate?.enable === true && Number.isFinite(Number(rate?.data?.rate))) traeRate = Number(rate.data.rate);
+	} catch {}
 	return {
 		id: String(info?.name ?? ""),
 		name,
 		contextWindow,
 		...(maxContextWindow === undefined ? {} : { maxContextWindow }),
 		...(traeEfforts.length === 0 ? {} : { traeEfforts }),
+		...(traeRate === undefined ? {} : { traeRate }),
 		maxTokens: 64_000,
 	};
 }
@@ -88,6 +98,11 @@ export async function refreshModels(token, signal) {
 	const seen = new Set();
 	const models = [{ id: "auto", name: "Trae Auto", contextWindow: 200_000, maxTokens: 64_000 }];
 	for (const info of raw) {
+		// User-configured custom models (the user's own API endpoints) never
+		// carry a consumption_rate and must not be offered here. Identify them
+		// by their identity flags, NOT by the absence of a rate — a future
+		// official model could temporarily lack rate data.
+		if (info?.is_preset === false || info?.custom_model_id != null) continue;
 		const model = catalogModel(info);
 		if (model.id === "" || seen.has(model.id)) continue;
 		seen.add(model.id);
