@@ -386,7 +386,14 @@ function createTraeShim({ stores, logger, preferences, endpointsFor }) {
 			}
 		} catch (error) {
 			if (!res.headersSent) {
-				writeOpenAIError(res, 502, "upstream_error", `trae upstream: ${safeMessage(error)}`);
+				// The intl roster intentionally includes locked models (the full
+				// tier view); when the upstream rejects one, say why instead of
+				// passing the bare protocol error through.
+				const detail = safeMessage(error);
+				const hint = edition === "intl" && detail.includes("not available")
+					? "（该模型需升级 Trae 付费档后使用）"
+					: "";
+				writeOpenAIError(res, 502, "upstream_error", `trae upstream: ${detail}${hint}`);
 			} else {
 				try { res.end(); } catch {}
 			}
@@ -431,7 +438,10 @@ function toPiModel(info, baseUrl, useMaximumContextWindow, providerId = TRAE_PRO
 	const efforts = Array.isArray(info.traeEfforts) ? info.traeEfforts : [];
 	// Price display mirrors dsh-qoder-connect / dsh-workbuddy-connect: a zero
 	// rate means free, other rates show as a multiplier. Models without a
-	// declared consumption_rate (experimental slots) get no suffix.
+	// declared consumption_rate (experimental slots) get no suffix. Locked
+	// models (intl tier view) carry their `· 🔒 未解锁` badge inside info.name
+	// from upstream.js — computed per catalog refresh from the live features
+	// data — and upstream.js drops their rate, so no multiplier shows here.
 	const priceSuffix = info.traeRate === undefined || info.traeRate === null
 		? ""
 		: info.traeRate === 0 ? " · 免费" : ` · x${info.traeRate}`;

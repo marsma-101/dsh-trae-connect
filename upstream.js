@@ -19,8 +19,10 @@
 // Auth requires BOTH headers at once: `Cloud-IDE-JWT: <token>` AND
 // `Authorization: Cloud-IDE-JWT <token>`; either one alone returns 401.
 // The intl models payload nests the roster one level deeper than CN:
-// `{code:0, data:{list:[{function:"solo_agent_remote", models:[…]}]}}` vs
-// the CN `{data:[…]}` — the parser accepts both shapes.
+// `{code:0, data:{list:[{function:"solo_agent", models:[…]}]}}` vs
+// the CN `{data:[…]}` — the parser accepts both shapes. The intl catalog is
+// fetched from the `solo_agent` bucket (the full per-account tier view, the
+// same 19 entries the intl UI shows); CN keeps `solo_agent_remote`.
 
 const REMOTE_BASE = "https://trae-api-cn.mchost.guru/api/remote/v1";
 const REMOTE_ORIGIN = "https://solo.trae.cn";
@@ -103,6 +105,37 @@ const liveFetchedAtByEdition = { cn: 0, intl: 0 };
 const MODEL_REFRESH_MS = 10 * 60 * 1000;
 
 /**
+ * Per-edition model-catalog bucket. intl uses `solo_agent` — live-verified
+ * 2026-10-08: that bucket returns the FULL 19-model per-account roster (the
+ * same list the intl UI shows), while `solo_agent_remote` returns a trimmed
+ * 10-model subset. Locked models are flagged from their features data (see
+ * modelLocked), never filtered, so the picker mirrors the real tier view.
+ * CN stays on `solo_agent_remote` (16 fully-usable models, no lock concept).
+ */
+const CATALOG_FUNCTION = { cn: "solo_agent_remote", intl: "solo_agent" };
+
+/**
+ * Whether a catalog entry is locked for the current account tier.
+ * Heuristic validated live on 2026-10-08 (11 models probed with a
+ * zero-credit create-then-delete session): locked ⟺ the features JSON's
+ * access.data.identity_list contains 5 and NOT 0 — 11/11 matched, including
+ * [0,5,4,1,2,3] unlocked vs [5,4,1,2,3] locked look-alikes. The upstream's
+ * official criterion is NOT confirmed. Recomputed from the latest catalog on
+ * every refresh, so a tier upgrade flips the flag without any code change.
+ */
+function modelLocked(info) {
+	try {
+		const feats = typeof info?.features === "string" ? JSON.parse(info.features) : info?.features;
+		const identities = feats?.access?.data?.identity_list;
+		if (!Array.isArray(identities)) return false;
+		const has = (value) => identities.some((entry) => Number(entry) === value);
+		return has(5) && !has(0);
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Placeholder roster for an edition that never successfully fetched a live
  * catalog (e.g. intl without a configured/verified upstream). Same shape the
  * adapter used for the "intl installed but unconfigured" card state, kept in
@@ -165,9 +198,19 @@ function catalogModel(info) {
 			traeRate = Number(feats.cost.data.manual_usage);
 		}
 	} catch {}
+	const locked = modelLocked(info);
+	// Locked models show the lock badge instead of a credit multiplier: drop
+	// the rate so index.js's toPiModel appends no `· x1` suffix on top of it.
+	if (locked) traeRate = undefined;
+	// Display name: unlocked keeps the rate suffix logic (owned by index.js's
+	// toPiModel — nothing appended here); locked models drop the rate and show
+	// the lock badge instead. Locked is recomputed from the live catalog on
+	// every refresh, never cached or hard-coded.
+	const displayName = locked ? `${name} · 🔒 未解锁` : name;
 	return {
 		id: String(info?.name ?? ""),
-		name,
+		name: displayName,
+		...(locked ? { locked } : {}),
 		contextWindow,
 		...(maxContextWindow === undefined ? {} : { maxContextWindow }),
 		...(traeEfforts.length === 0 ? {} : { traeEfforts }),
@@ -187,10 +230,11 @@ export function isMaxModeModel(model) {
 /** Parse the model-list payload into a filtered roster (no side effects).
  * Two verified payload shapes are accepted:
  *   CN: `{data:[…models…]}` — the data field IS the model array;
- *   intl (2026-10-08): `{code:0, data:{list:[{function:"solo_agent_remote",
+ *   intl (2026-10-08): `{code:0, data:{list:[{function:"solo_agent",
  *   models:[…]}]}}` — the roster hides in data.list[].models, and the
- *   solo_agent_remote entry wins when several function groups come back. */
-function parseModelList(payload) {
+ *   edition's own function bucket (CATALOG_FUNCTION) wins when several
+ *   function groups come back. */
+function parseModelList(payload, functionBucket = "solo_agent_remote") {
 	const data = payload?.data;
 	let raw;
 	if (Array.isArray(data)) {
@@ -198,10 +242,10 @@ function parseModelList(payload) {
 	} else {
 		const groups = data?.list ?? [];
 		const list = Array.isArray(groups) ? groups : [];
-		// Prefer the solo_agent_remote group; fall back to the first group
+		// Prefer this edition's agent group; fall back to the first group
 		// that actually carries models.
 		const agentGroup = list.find(
-			(group) => String(group?.function ?? group?.agent_type ?? "") === "solo_agent_remote",
+			(group) => String(group?.function ?? group?.agent_type ?? "") === functionBucket,
 		) ?? list.find((group) => Array.isArray(group?.models) && group.models.length > 0);
 		raw = Array.isArray(agentGroup?.models) ? agentGroup.models : [];
 	}
@@ -227,11 +271,12 @@ export async function refreshModels(token, signal, edition = "cn", overrides) {
 	if (endpoints.remoteBase === "") {
 		throw new Error(`trae model list: 未配置 ${edition === "intl" ? "国际版" : "国内版"} 上游地址`);
 	}
-	const url = `${endpoints.remoteBase}/models?functions=solo_agent_remote&show_custom_model=true`;
+	const functionBucket = CATALOG_FUNCTION[edition] ?? "solo_agent_remote";
+	const url = `${endpoints.remoteBase}/models?functions=${encodeURIComponent(functionBucket)}&show_custom_model=true`;
 	const response = await fetch(url, { headers: buildHeaders(token, edition, {}, endpoints), signal });
 	if (!response.ok) throw new Error(`trae model list [${response.status}]`);
 	const payload = await response.json();
-	const models = parseModelList(payload);
+	const models = parseModelList(payload, functionBucket);
 	if (models.length <= 1) throw new Error("trae model list returned no models");
 	liveModelsByEdition[edition] = models;
 	liveFetchedAtByEdition[edition] = Date.now();
@@ -348,7 +393,10 @@ async function fetchModelConfig(token, edition, modelName, signal, overrides) {
 	if (modelConfigCacheByEdition[edition] === undefined || now - modelConfigFetchedAtByEdition[edition] > MODEL_CONFIG_TTL_MS) {
 		const endpoints = remoteEndpointsFor(edition, overrides);
 		if (endpoints.remoteBase === "") throw new Error(`trae model list: 未配置 ${edition === "intl" ? "国际版" : "国内版"} 上游地址`);
-		const url = `${endpoints.remoteBase}/models?functions=solo_agent_remote&show_custom_model=true`;
+		// Same bucket as refreshModels: the config cache must index the same
+		// roster the picker shows (intl = solo_agent full tier view).
+		const functionBucket = CATALOG_FUNCTION[edition] ?? "solo_agent_remote";
+		const url = `${endpoints.remoteBase}/models?functions=${encodeURIComponent(functionBucket)}&show_custom_model=true`;
 		const response = await fetch(url, { headers: buildHeaders(token, edition, {}, endpoints), signal });
 		if (!response.ok) throw new Error(`trae model list [${response.status}]`);
 		const payload = await response.json();
@@ -453,7 +501,16 @@ export async function createSession(token, model, messages, signal, options = {}
 		signal,
 	});
 	const text = await response.text();
-	if (!response.ok) throw new Error(`trae create_session [${response.status}]: ${text.slice(0, 400)}`);
+	if (!response.ok) {
+		let message = `trae create_session [${response.status}]: ${text.slice(0, 400)}`;
+		// Locked models stay selectable (the roster mirrors the full tier
+		// view), so the upstream rejects them here. Point at the tier upgrade
+		// instead of the bare protocol error.
+		if (edition === "intl" && text.includes("not available")) {
+			message += "（该模型需升级 Trae 付费档后使用）";
+		}
+		throw new Error(message);
+	}
 	let payload;
 	try { payload = JSON.parse(text); } catch { throw new Error(`trae create_session non-JSON: ${text.slice(0, 200)}`); }
 	const data = payload?.data ?? payload ?? {};
