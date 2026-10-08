@@ -10,12 +10,16 @@
 // and Origin https://solo.trae.cn.
 //
 // International edition (live-verified 2026-10-08 against a real account):
-// remote gate `https://core-normal.trae.ai/api/remote/v1` — host taken from
-// the app's own product.json `remote.trae` section (SG/US mirror
-// coresg-normal.trae.ai serves the same path with the same effect), web
-// origin `https://work.trae.ai` (product.json soloUrl, used as Origin/
-// Referer). The credential record's own host (growsg-normal.trae.ai) is the
-// AUTH domain, NOT the remote gate — never use it as remoteBase.
+// the remote gate is NOT a constant — it is per account region, taken from the
+// app's own product.json `remote.trae` section (`{normal, SG, US, USTP}`; an
+// SG account is served by coresg-normal.trae.ai, a US one by its own mirror).
+// install.js reads the installed program and hands the answer to
+// applyDetectedInstall() below, which remoteEndpointsFor() prefers over the
+// compiled-in `core-normal.trae.ai` table (that mirror only happened to serve
+// this machine's account). The web origin is product.json's soloUrl
+// (https://work.trae.ai, used as Origin/Referer). The credential record's own
+// host (growsg-normal.trae.ai) is the AUTH domain, NOT the remote gate — never
+// use it as remoteBase.
 // Auth requires BOTH headers at once: `Cloud-IDE-JWT: <token>` AND
 // `Authorization: Cloud-IDE-JWT <token>`; either one alone returns 401.
 // The intl models payload nests the roster one level deeper than CN:
@@ -30,9 +34,17 @@ const CREDITS_BASE = "https://api.trae.cn";
 const BROWSER_UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
+// Re-exported so index.js has ONE import site for install discovery. The
+// credentials/auth side of the protocol stays here; only "where is the app
+// installed, and which mirror does it talk to" comes from install.js.
+export { detectInstall } from "./install.js";
+
 /**
- * Per-edition remote-session endpoints. intl defaults are live-verified
- * (2026-10-08); a Config-card / environment override still wins over them.
+ * Per-edition remote-session endpoints. These are the LAST resort, not the
+ * source of truth (2026-10-08): the remote gate is region-dependent, so the
+ * live answer comes from applyDetectedInstall() and these constants only cover
+ * the no-install / undetected case. A Config-card / environment override still
+ * beats everything.
  */
 const REMOTE_ENV = {
 	cn: {
@@ -56,16 +68,49 @@ const REMOTE_ENV = {
 };
 
 /**
- * Effective endpoints for one edition, after Config-card / environment
- * overrides. Never throws; callers check `remoteBase !== ""` before use.
+ * Install-detected remote gate, per edition: {remoteBase} or undefined.
+ *
+ * Why: a Trae account is served by a regional mirror picked from product.json's
+ * `remote.trae` table, so hard-coding the intl gate (core-normal) breaks any
+ * account outside that mirror's region. Only the remote gate follows the
+ * install — the web origin deliberately does NOT, because the values the
+ * desktop client actually sends were live-verified per edition (cn really
+ * presents solo.trae.cn, which differs from product.json's soloUrl) and
+ * changing it on a detection signal would trade a verified header for an
+ * unverified one. `undefined` means "no usable detection" — the compiled-in
+ * table applies.
+ */
+const detectedRemoteByEdition = { cn: undefined, intl: undefined };
+
+/**
+ * Record one edition's install detection result (from install.js
+ * detectInstall) for remoteEndpointsFor() to prefer. A missing install, or one
+ * that fell back to compiled-in hosts, is stored as undefined so a stale
+ * detection from a previous account can never outlive the reason for it.
+ */
+export function applyDetectedInstall(edition, install) {
+	const remoteBase = String(install?.remoteBase ?? "").trim().replace(/\/+$/, "");
+	const usable = install !== undefined && install !== null && install.source !== "compiled-in" && remoteBase !== "";
+	detectedRemoteByEdition[edition] = usable ? { remoteBase } : undefined;
+	return detectedRemoteByEdition[edition];
+}
+
+/**
+ * Effective endpoints for one edition. Precedence is
+ *   override (Config card / env) > detected (install.js) > compiled-in table.
+ * The override stays on top so a user can always pin a host that the local
+ * install does not (or does not yet) advertise; the compiled-in table stays last
+ * so an undetected install still has something to talk to. Never throws;
+ * callers check `remoteBase !== ""` before use.
  */
 export function remoteEndpointsFor(edition, overrides = {}) {
 	const base = REMOTE_ENV[edition] ?? REMOTE_ENV.cn;
 	const overrideRemote = String(overrides.remoteBase ?? "").trim().replace(/\/+$/, "");
 	const overrideOrigin = String(overrides.webOrigin ?? "").trim().replace(/\/+$/, "");
+	const detectedRemote = String(detectedRemoteByEdition[edition]?.remoteBase ?? "").trim().replace(/\/+$/, "");
 	return {
 		...base,
-		remoteBase: overrideRemote !== "" ? overrideRemote : base.remoteBase,
+		remoteBase: overrideRemote !== "" ? overrideRemote : detectedRemote !== "" ? detectedRemote : base.remoteBase,
 		webOrigin: overrideOrigin !== "" ? overrideOrigin : base.webOrigin,
 	};
 }
@@ -116,20 +161,22 @@ const CATALOG_FUNCTION = { cn: "solo_agent_remote", intl: "solo_agent" };
 
 /**
  * Whether a catalog entry is locked for the current account tier.
- * Heuristic validated live on 2026-10-08 (11 models probed with a
- * zero-credit create-then-delete session): locked ⟺ the features JSON's
- * access.data.identity_list contains 5 and NOT 0 — 11/11 matched, including
- * [0,5,4,1,2,3] unlocked vs [5,4,1,2,3] locked look-alikes. The upstream's
- * official criterion is NOT confirmed. Recomputed from the latest catalog on
- * every refresh, so a tier upgrade flips the flag without any code change.
+ * Official criterion: `features.access.enable === true`. Reconciled on
+ * 2026-10-08 across the 19 intl models against the desktop program's own
+ * `restrictedModelKeys` (its ground truth in window1/renderer.log) — 19/19,
+ * zero mismatches. The 8 locked ones (gpt-6-astra / gpt-6-sol / gpt-6-luna /
+ * gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna / gpt-5.5 / glm-5.2) all carry
+ * `access.enable: true`; the other 11 leave it undefined.
+ * Superseded heuristic: `access.data.identity_list` contains 5 and NOT 0 —
+ * wrong on gpt-6-sol and gpt-6-luna, whose identity_list is [4,1,2,3] (neither
+ * 5 nor 0) while the program does consider them locked.
+ * Recomputed from the latest catalog on every refresh, so a tier upgrade
+ * flips the flag off on its own, with no code change.
  */
 function modelLocked(info) {
 	try {
 		const feats = typeof info?.features === "string" ? JSON.parse(info.features) : info?.features;
-		const identities = feats?.access?.data?.identity_list;
-		if (!Array.isArray(identities)) return false;
-		const has = (value) => identities.some((entry) => Number(entry) === value);
-		return has(5) && !has(0);
+		return feats?.access?.enable === true;
 	} catch {
 		return false;
 	}
@@ -178,12 +225,33 @@ function catalogModel(info) {
 	const maxContextWindow = info?.max_mode === true && Number(ctx.max) > 0 ? Number(ctx.max) : undefined;
 	const display = String(info?.display_name ?? info?.display_model_name ?? "").trim();
 	const name = display !== "" ? display : String(info?.name ?? info?.config_name ?? "");
-	// Thinking capability: the upstream declares per-model effort options
-	// (light/high/extra_high) or support_thinking=false for non-thinking models.
-	const effortConfig = info?.reasoning_effort_config;
-	const traeEfforts = effortConfig?.support_thinking === true && Array.isArray(effortConfig.options)
-		? effortConfig.options.filter((level) => typeof level === "string")
-		: [];
+	// Thinking capability: the capability flag is `features.reasoning.enable`
+	// inside the features JSON (string or object), verified true on 19/19 live
+	// intl models. `reasoning_effort_config` is NOT the capability flag: on the
+	// live intl catalog only kimi-k3 carries it, so keying thinking off it
+	// marked the other 18 reasoning models as `reasoning: false`. Its
+	// `options` list is still the most precise source when present (kimi-k3
+	// declares light/high/extra_high), but it is optional — a capable model
+	// without it falls back to Trae's online three-tier spelling. A model that
+	// is not capable (or whose features JSON fails to parse) publishes no
+	// efforts at all, so index.js's toPiModel still labels it
+	// `reasoning: false`; this stays edition-agnostic, CN included.
+	let reasoningCapable = false;
+	let declaredEfforts = [];
+	try {
+		const feats = typeof info?.features === "string" ? JSON.parse(info.features) : info?.features;
+		reasoningCapable = feats?.reasoning?.enable === true;
+		const effortConfig = info?.reasoning_effort_config;
+		if (reasoningCapable && Array.isArray(effortConfig?.options)) {
+			declaredEfforts = effortConfig.options.filter((level) => typeof level === "string");
+		}
+	} catch {
+		reasoningCapable = false;
+		declaredEfforts = [];
+	}
+	const traeEfforts = !reasoningCapable
+		? []
+		: declaredEfforts.length > 0 ? declaredEfforts : ["light", "high", "extra_high"];
 	// Consumption rate (credit multiplier) lives inside the features JSON,
 	// which arrives as either a string or an object. CN declares
 	// `consumption_rate.data.rate`; intl (live-verified 2026-10-08) declares
@@ -445,8 +513,13 @@ export async function createSession(token, model, messages, signal, options = {}
 		content: [],
 		query: flattenQuery(messages),
 		model_name: modelName,
-		agent_type: "solo_agent_remote",
-		agent_id: "solo_agent_remote",
+		// Must match the edition's catalog bucket (CATALOG_FUNCTION): the
+		// upstream resolves model configs by Function(=agent_type) +
+		// ConfigName(=model_name), so a model registered in the intl
+		// `solo_agent` bucket is invisible under `solo_agent_remote` and the
+		// event stream fails with 4001 "config item is empty".
+		agent_type: CATALOG_FUNCTION[edition] ?? "solo_agent_remote",
+		agent_id: CATALOG_FUNCTION[edition] ?? "solo_agent_remote",
 		model_selection_strategy: model === "auto" ? "auto" : "manual",
 		common_params: commonParams(edition, mode, sessionId, endpoints),
 	};

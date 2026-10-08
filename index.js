@@ -40,6 +40,11 @@ import {
 	fetchCredits,
 	deleteSession,
 	remoteEndpointsFor,
+	// detectInstall (re-exported by upstream.js so the import graph above stays
+	// one line) locates the installed Trae program; applyDetectedInstall hands
+	// its answer to the remote-gate resolution — both added 2026-10-08.
+	detectInstall,
+	applyDetectedInstall,
 } from "./upstream.js";
 
 /**
@@ -67,11 +72,11 @@ export const Config = z.object({
 	intlRemoteBase: z.string()
 		.default("")
 		.volatile()
-		.description("国际版上游地址（remote v1 根）。已实测默认 https://core-normal.trae.ai/api/remote/v1（官方 product.json 亲供），留空即用默认；填写后覆盖默认值。"),
+		.description("国际版上游地址（remote v1 根）。留空即自动取已安装 Trae 程序 product.json 里按账号地区选出的镜像（2026-10-08 起；如 SG 账号 coresg-normal.trae.ai），未检测到安装时回落到内置默认 https://core-normal.trae.ai/api/remote/v1。填写后强制覆盖自动检测。"),
 	intlWebOrigin: z.string()
 		.default("")
 		.volatile()
-		.description("国际版 Web Origin（已实测默认 https://work.trae.ai；留空即用默认值）"),
+		.description("国际版 Web Origin。留空即取已安装程序的 product.json soloUrl（实测 https://work.trae.ai），填写后强制覆盖自动检测。"),
 	intlCreditsBase: z.string()
 		.default("")
 		.volatile()
@@ -573,12 +578,55 @@ export async function apply(ctx, config) {
 	// One startup scan logs the candidates; each edition's store re-scans on
 	// resolve() (desktop re-login must be picked up within one turn), so the
 	// scan itself stays cheap and quiet after startup.
-	const startupScan = discoverDesktopAuths({
+	//
+	// discoverDesktopAuths is async (it consults the installed app for the
+	// edition verdict), so it MUST be awaited here — before this it was called
+	// without await, and `startupScan.results` was read off a Promise, so the
+	// startup log and the region→remote-gate detection below saw nothing.
+	const startupScan = await discoverDesktopAuths({
 		logger,
 		explicitCnPath: preferences.dataDirCn() || process.env.TRAE_DATA_DIR_CN,
 		explicitIntlPath: preferences.dataDirIntl() || process.env.TRAE_DATA_DIR_INTL,
 	});
 	const found = startupScan.results;
+
+	// Resolved credential records per edition, refreshed by the same awaited
+	// discovery that feeds each store's `discover` callback (2026-10-08).
+	// TraeCredentialStore calls that callback SYNCHRONOUSLY from load()/resolve()
+	// (credentials.js is intentionally not changed), so the awaited result is
+	// published here and the callback reads this cache instead of returning a
+	// Promise — otherwise `load()` would destructure a Promise into an empty
+	// credential and persist it.
+	const desktopAuthByEdition = { cn: undefined, intl: undefined };
+	/** Run one discovery pass and publish every edition's record. */
+	const refreshDesktopAuths = async (options = {}) => {
+		const scan = await discoverDesktopAuths({
+			logger,
+			explicitCnPath: preferences.dataDirCn() || process.env.TRAE_DATA_DIR_CN,
+			explicitIntlPath: preferences.dataDirIntl() || process.env.TRAE_DATA_DIR_INTL,
+			quiet: true,
+			...options,
+		});
+		desktopAuthByEdition.cn = scan.results.cn;
+		desktopAuthByEdition.intl = scan.results.intl;
+		return scan.results;
+	};
+	desktopAuthByEdition.cn = found.cn;
+	desktopAuthByEdition.intl = found.intl;
+	/** In-flight discovery pass, shared so concurrent callers scan once. */
+	let desktopAuthScan;
+	/**
+	 * Awaitable refresh used by the async paths (startup sweep, credential
+	 * sweep). Coalesces concurrent callers onto one discovery pass; the sync
+	 * `discover` callback below awaits it too, but never blocks on it.
+	 */
+	const ensureDesktopAuthScan = async () => {
+		desktopAuthScan ??= refreshDesktopAuths().finally(() => {
+			desktopAuthScan = undefined;
+		});
+		return desktopAuthScan;
+	};
+
 	if (found.cn === undefined && found.intl === undefined) {
 		logger.warn?.(`dsh-trae-connect: 未找到任何可解密的 Trae 登录凭据（候选目录见上方扫描日志）。${SIGN_IN_HINT}`);
 	}
@@ -587,6 +635,26 @@ export async function apply(ctx, config) {
 			logger.info?.(`dsh-trae-connect: ${EDITION_META[edition].displayName} 凭据来自 ${found[edition]._path}`);
 		} else {
 			logger.info?.(`dsh-trae-connect: ${EDITION_META[edition].displayName} 未在本机发现已登录凭据`);
+		}
+	}
+
+	// The remote gate is region-dependent (product.json picks a mirror per
+	// account region), so detection runs per edition with THAT edition's region
+	// taken from its own credential record. detection only prefers the installed
+	// app's hosts; remoteEndpointsFor still lets a Config-card/env override win
+	// over it, and a detection failure must never stop the plugin from
+	// starting — either way the compiled-in table applies.
+	for (const edition of EDITIONS) {
+		try {
+			const region = String(found[edition]?.userRegion?.region ?? "").trim();
+			const install = await detectInstall(edition, region);
+			applyDetectedInstall(edition, install);
+			if (install.source !== "compiled-in") {
+				logger.info?.(`dsh-trae-connect: ${EDITION_META[edition].displayName} 上游来自已安装程序（${install.appRoot}${region === "" ? "" : `，账号地区 ${region}`}）— ${install.remoteBase}`);
+			}
+		} catch (error) {
+			applyDetectedInstall(edition, undefined);
+			logger.warn?.(`dsh-trae-connect: ${EDITION_META[edition].displayName} 安装检测失败（${safeMessage(error)}），沿用内置上游地址`);
 		}
 	}
 
@@ -624,12 +692,24 @@ export async function apply(ctx, config) {
 				// intl refreshHost override: only a fallback — the credential
 				// record's own host (the auth domain, live-verified) wins.
 				...(edition === "cn" ? {} : { refreshHost: preferences.intlRemoteBase() }),
-				discover: () => discoverDesktopAuths({
-					logger,
-					explicitCnPath: preferences.dataDirCn() || process.env.TRAE_DATA_DIR_CN,
-					explicitIntlPath: preferences.dataDirIntl() || process.env.TRAE_DATA_DIR_INTL,
-					quiet: true,
-				}).results[edition],
+				// Synchronous reader of the discovery result that
+				// refreshDesktopAuths() already awaited (2026-10-08).
+				//
+				// Why not `discover: async () => (await discoverDesktopAuths(...)).results[edition]`:
+				// TraeCredentialStore consumes this callback synchronously
+				// (credentials.js load() line ~572 and resolve() line ~604), so an
+				// async callback hands it a Promise; `const {_path, _edition,
+				// ...auth} = promise` yields an EMPTY auth, which load() then
+				// persists over the real credential, and resolve() treats as a
+				// token change. Since credentials.js is out of scope for this
+				// change, the await lives here instead: each call kicks one
+				// shared discovery pass (same cost the old sync call had) and
+				// answers from the last resolved record, so a desktop re-login
+				// is still picked up on the next resolve().
+				discover: () => {
+					void ensureDesktopAuthScan();
+					return desktopAuthByEdition[edition];
+				},
 			});
 			store.load();
 			stores[edition] = store;
@@ -788,6 +868,22 @@ export async function apply(ctx, config) {
 				resetLiveModels(edition);
 			}
 			sweepState.set(edition, { userId: identity.userId });
+			// Re-run the install detection on a new login or an account switch
+			// (2026-10-08): the remote gate is chosen per account REGION, so an
+			// account that moved region (or replaced the previous one) would keep
+			// talking to the old mirror if the gate were only resolved at
+			// startup. Done BEFORE syncCatalog() so the catalog pull already uses
+			// the corrected remoteBase, and wrapped so a discovery failure falls
+			// back to the compiled-in table instead of failing the sign-in path.
+			try {
+				const region = identity.region || String(store.current?.auth?.userRegion?.region ?? "").trim();
+				const install = await detectInstall(edition, region);
+				applyDetectedInstall(edition, install);
+				logger.info?.(`dsh-trae-connect: ${meta.displayName} 上游重检（${install.source}${region === "" ? "" : `，账号地区 ${region}`}）— ${install.remoteBase}`);
+			} catch (error) {
+				applyDetectedInstall(edition, undefined);
+				logger.warn?.(`dsh-trae-connect: ${meta.displayName} 上游重检失败（${safeMessage(error)}），沿用内置上游地址`);
+			}
 			logger.info?.(`dsh-trae-connect: ${meta.displayName} ${hadCredential ? "登录身份已切换" : "检测到新登录凭据"} — 填充模型目录`);
 			trae.invalidate();
 			publishCatalogs();
@@ -798,13 +894,23 @@ export async function apply(ctx, config) {
 			const meta = EDITION_META[edition];
 			const store = stores[edition];
 			if (store === undefined) return;
-			// The desktop record is the sign-in source of truth. A failed read
-			// is treated as "no sighting" (the two-miss rule above decides
-			// whether that means signed out).
+			// The desktop record is the sign-in source of truth, and it is read
+			// asynchronously (2026-10-08: discoverDesktopAuths is async because
+			// the edition verdict consults the installed app). Await the scan
+			// FIRST, then read the store — a sync read before the await would
+			// only see the previous pass's record and could miss a re-login by a
+			// whole sweep interval. A failed read is treated as "no sighting"
+			// (the two-miss rule above decides whether that means signed out).
+			await ensureDesktopAuthScan();
 			const desktop = store.discover();
 			const identity = desktop === undefined
 				? undefined
-				: { userId: desktop.userId === undefined ? "?" : String(desktop.userId) };
+				: {
+					userId: desktop.userId === undefined ? "?" : String(desktop.userId),
+					// Carried so a new login / account switch can re-run the
+					// install detection with THIS account's region.
+					region: String(desktop.userRegion?.region ?? "").trim(),
+				};
 			await adoptCredential(edition, meta, identity);
 		};
 		const sweepAll = async () => {
